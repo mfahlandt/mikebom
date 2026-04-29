@@ -7,9 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/) once it exits
 
 ## [Unreleased]
 
-(Nothing yet. Land changes here, then cut a release per the
-`release.yml` workflow trigger documented in
-`docs/contributing/release.md`.)
+### Added
+
+- **`Basic` auth challenge support for the OCI registry pull** (044
+  commit 2). The 401-retry path now accepts both `Bearer` (existing
+  Docker Hub / GHCR / gcr.io flow) and `Basic` (AWS ECR's flavor)
+  `WWW-Authenticate` challenges. For `Basic`, mikebom applies the
+  cached docker-config credentials directly on the original request
+  — no token-realm round-trip. Resolves the previous
+  `WWW-Authenticate is not a Bearer challenge: Basic ...` error
+  on `mikebom sbom scan --image <ecr-ref> --image-src remote`. The
+  `~/.docker/config.json` lookup is unchanged (already supported
+  `auths.<host>.auth`, `credHelpers`, `credsStore` since milestone
+  034); only the challenge parser was Bearer-only.
+- **Local docker daemon as a default image source** (044 commit 1).
+  `mikebom sbom scan --image <ref>` now consults the local docker
+  daemon before reaching for a registry pull, matching trivy and
+  syft conventions. New `--image-src docker,remote` flag controls
+  the source-resolution order; default is `docker,remote`. Force a
+  fresh registry fetch with `--image-src remote`. Docker source
+  shells out to `docker image inspect` + `docker save`, so the
+  user's existing `DOCKER_HOST` / contexts are honored. Resolves
+  the case where an ECR image is already cached locally but the
+  registry pull is failing (e.g. on a Basic-auth challenge).
 
 ## [0.1.0-alpha.5] — 2026-04-29
 
