@@ -433,11 +433,35 @@ fn scan_go_source_plus_binary_filters_go_sum_to_linked_subset() {
     let sbom = scan_path(dir.path());
     let golang = golang_purls(&sbom);
 
-    // The never-linked module must NOT appear — it was in go.sum
-    // but not in BuildInfo.
+    // Milestone 050: the never-linked module IS retained (no longer
+    // dropped) and carries a `mikebom:not-linked = true` property
+    // identifying it as in-go.sum-but-not-in-BuildInfo. Consumers
+    // wanting the strict "what shipped" view filter on this property.
     assert!(
-        !golang.iter().any(|p| p.contains("never-linked/fake")),
-        "never-linked/fake must be dropped by G3 filter: {golang:?}",
+        golang.iter().any(|p| p.contains("never-linked/fake")),
+        "never-linked/fake must be RETAINED (milestone 050 — \
+         tagged not dropped): {golang:?}",
+    );
+    let fake_props = sbom["components"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .find(|c| {
+            c["purl"]
+                .as_str()
+                .is_some_and(|p| p.contains("never-linked/fake"))
+        })
+        .and_then(|c| c["properties"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        fake_props.iter().any(|p| {
+            p["name"].as_str() == Some("mikebom:not-linked")
+                && (p["value"].as_str() == Some("true")
+                    || p["value"].as_bool() == Some(true))
+        }),
+        "never-linked/fake must carry mikebom:not-linked = true: \
+         props={fake_props:?}",
     );
 
     // The binary's BuildInfo modules (logrus, go-spew, etc.) DO
@@ -739,5 +763,89 @@ fn scan_go_cache_zip_alone_is_retained_when_no_binary() {
         golang.iter().any(|p| p.contains("sirupsen/logrus@v1.9.4")),
         "scratch scan must retain cache-ZIP entry when no \
          BuildInfo contradicts: {golang:?}",
+    );
+}
+
+// --- Milestone 050: BuildInfo-vs-go.sum scope hint --------------------
+
+/// Helper that mirrors `scan_path` but returns stderr alongside the
+/// SBOM. Needed for the milestone-050 hint test, which asserts on
+/// the `tracing::info` line rather than SBOM content.
+fn scan_path_with_stderr(path: &std::path::Path) -> (serde_json::Value, String) {
+    let bin = env!("CARGO_BIN_EXE_mikebom");
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let out_path = tmp.path().to_path_buf();
+    let output = Command::new(bin)
+        .arg("--offline")
+        .arg("sbom")
+        .arg("scan")
+        .arg("--path")
+        .arg(path)
+        .arg("--output")
+        .arg(&out_path)
+        .arg("--no-deep-hash")
+        .output()
+        .expect("mikebom should run");
+    assert!(
+        output.status.success(),
+        "scan failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = std::fs::read_to_string(&out_path).expect("read sbom");
+    let sbom = serde_json::from_str(&raw).expect("valid JSON");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (sbom, stderr)
+}
+
+#[test]
+fn scan_go_source_only_emits_buildinfo_scope_hint() {
+    // Milestone 050 SC-001: when `mikebom sbom scan --path` finds a
+    // go.mod but no built Go binary in the rootfs, emit a hint
+    // explaining the SBOM scope and how to tighten it via
+    // `go build` + the existing G3 BuildInfo intersection.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = dir.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("go.mod"),
+        "module example.com/m050\n\
+         go 1.22\n\
+         require github.com/sirupsen/logrus v1.9.4\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("go.sum"),
+        "github.com/sirupsen/logrus v1.9.4 h1:fake/sha==\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("main.go"),
+        "package main\n\
+         import \"github.com/sirupsen/logrus\"\n\
+         func main() { logrus.Info(\"hi\") }\n",
+    )
+    .unwrap();
+
+    let (_sbom, stderr) = scan_path_with_stderr(dir.path());
+    assert!(
+        stderr.contains("no Go binary found alongside go.mod")
+            && stderr.contains("mikebom:not-linked"),
+        "SC-001: hint must fire when go.mod parsed but no binary \
+         present, naming the not-linked annotation. stderr was: {stderr}",
+    );
+}
+
+#[test]
+fn scan_go_non_go_project_does_not_emit_buildinfo_hint() {
+    // Milestone 050 FR-004: hint MUST NOT fire when no go.mod is
+    // parsed (i.e., not a Go project). The scan-mode condition is
+    // gated on `go_signals.main_modules` being non-empty.
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Empty rootfs — nothing for the Go reader to find.
+    let (_sbom, stderr) = scan_path_with_stderr(dir.path());
+    assert!(
+        !stderr.contains("no Go binary found alongside go.mod"),
+        "FR-004: hint must NOT fire on non-Go scans. stderr was: \
+         {stderr}",
     );
 }
